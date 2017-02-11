@@ -332,12 +332,20 @@ class PipelineWorker : public Nan::AsyncWorker {
         image = image.colourspace(VIPS_INTERPRETATION_B_W);
       }
 
-      // Ensure image has an alpha channel when there is an overlay
-      bool hasOverlay = baton->overlay != nullptr;
-      if (hasOverlay && !HasAlpha(image)) {
-        double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
-        image = image.bandjoin(
-          VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
+      // Ensure image has an alpha channel when there is an overlay with an alpha channel
+      VImage overlayImage;
+      ImageType overlayImageType = ImageType::UNKNOWN;
+      bool shouldOverlayWithAlpha = FALSE;
+      if (baton->overlay != nullptr) {
+        std::tie(overlayImage, overlayImageType) = OpenInput(baton->overlay, baton->accessMethod);
+        if (HasAlpha(overlayImage)) {
+          shouldOverlayWithAlpha = !baton->overlayCutout;
+          if (!HasAlpha(image)) {
+            double const multiplier = sharp::Is16Bit(image.interpretation()) ? 256.0 : 1.0;
+            image = image.bandjoin(
+              VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
+          }
+        }
       }
 
       bool const shouldShrink = xshrink > 1 || yshrink > 1;
@@ -345,9 +353,8 @@ class PipelineWorker : public Nan::AsyncWorker {
       bool const shouldBlur = baton->blurSigma != 0.0;
       bool const shouldConv = baton->convKernelWidth * baton->convKernelHeight > 0;
       bool const shouldSharpen = baton->sharpenSigma != 0.0;
-      bool const shouldCutout = baton->overlayCutout;
       bool const shouldPremultiplyAlpha = HasAlpha(image) &&
-        (shouldShrink || shouldReduce || shouldBlur || shouldConv || shouldSharpen || (hasOverlay && !shouldCutout));
+        (shouldShrink || shouldReduce || shouldBlur || shouldConv || shouldSharpen || shouldOverlayWithAlpha);
 
       // Premultiply image alpha channel before all transformations to avoid
       // dark fringing around bright pixels
@@ -580,10 +587,7 @@ class PipelineWorker : public Nan::AsyncWorker {
       }
 
       // Composite with overlay, if present
-      if (hasOverlay) {
-        VImage overlayImage;
-        ImageType overlayImageType = ImageType::UNKNOWN;
-        std::tie(overlayImage, overlayImageType) = OpenInput(baton->overlay, baton->accessMethod);
+      if (baton->overlay != nullptr) {
         // Check if overlay is tiled
         if (baton->overlayTile) {
           int const overlayImageWidth = overlayImage.width();
@@ -616,7 +620,7 @@ class PipelineWorker : public Nan::AsyncWorker {
           // the overlayGravity was used for extract_area, therefore set it back to its default value of 0
           baton->overlayGravity = 0;
         }
-        if (shouldCutout) {
+        if (baton->overlayCutout) {
           // 'cut out' the image, premultiplication is not required
           image = sharp::Cutout(overlayImage, image, baton->overlayGravity);
         } else {
@@ -632,8 +636,12 @@ class PipelineWorker : public Nan::AsyncWorker {
             image = image.bandjoin(
               VImage::new_matrix(image.width(), image.height()).new_from_image(255 * multiplier));
           }
-          // Ensure overlay is premultiplied sRGB
-          overlayImage = overlayImage.colourspace(VIPS_INTERPRETATION_sRGB).premultiply();
+          // Ensure overlay is sRGB
+          overlayImage = overlayImage.colourspace(VIPS_INTERPRETATION_sRGB);
+          // Ensure overlay matches premultiplication state
+          if (shouldPremultiplyAlpha) {
+            overlayImage = overlayImage.premultiply();
+          }
           if (baton->overlayXOffset >= 0 && baton->overlayYOffset >= 0) {
             // Composite images with given offsets
             image = sharp::Composite(overlayImage, image, baton->overlayXOffset, baton->overlayYOffset);
